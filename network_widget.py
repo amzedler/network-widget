@@ -21,7 +21,7 @@ def measure_ping():
     """Returns average ping in ms, or None on failure."""
     try:
         result = subprocess.run(
-            ["ping", "-c", str(PING_COUNT), "-q", PING_HOST],
+            ["/sbin/ping", "-c", str(PING_COUNT), "-q", PING_HOST],
             capture_output=True, text=True, timeout=15
         )
         for line in result.stdout.splitlines():
