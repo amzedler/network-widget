@@ -6,13 +6,19 @@ Network Toolbar Widget
 """
 
 import rumps
+import AppKit
 import subprocess
 import threading
 import time
-import speedtest as speedtest_lib
+import datetime
+import json
+import glob
+
+VERSION = "1.0"
+MAX_HISTORY = 10
 
 PING_INTERVAL = 60       # seconds
-SPEED_INTERVAL = 3600    # seconds (1 hour)
+SPEED_INTERVAL = 600     # seconds (10 minutes)
 PING_HOST = "8.8.8.8"
 PING_COUNT = 4
 
@@ -35,19 +41,39 @@ def measure_ping():
     return None
 
 
+# Resolve fast-cli from whatever Node version nvm has installed
+_fast_candidates = sorted(glob.glob("/Users/adamz/.nvm/versions/node/*/bin/fast"))
+FAST_CLI = _fast_candidates[-1] if _fast_candidates else "fast"
+
+# Ping thresholds for color indicator (ms)
+PING_GOOD = 50
+PING_WARN = 100
+
+
+def _fmt_speed(mbps):
+    """Format Mbps compactly: ≥1000 → single decimal Gbps, else integer Mbps."""
+    if mbps is None:
+        return "…"
+    if mbps >= 1000:
+        return f"{mbps / 1000:.1f}G"
+    return f"{mbps:.0f}M"
+
+
 def measure_speed():
-    """Returns (download_mbps, upload_mbps) or (None, None) on failure."""
+    """Returns (download_mbps, upload_mbps, server_str) or (None, None, None) on failure."""
     try:
-        st = speedtest_lib.Speedtest(secure=True)
-        st.get_best_server()
-        st.download(threads=4)
-        st.upload(threads=4)
-        results = st.results.dict()
-        dl = results["download"] / 1_000_000  # bits → Mbps
-        ul = results["upload"] / 1_000_000
-        return dl, ul
+        result = subprocess.run(
+            [FAST_CLI, "--upload", "--json"],
+            capture_output=True, text=True, timeout=120
+        )
+        data = json.loads(result.stdout)
+        dl = data["downloadSpeed"]   # already in Mbps
+        ul = data["uploadSpeed"]
+        servers = ", ".join(data.get("serverLocations", [])[:2])
+        return dl, ul, f"fast.com ({servers})"
     except Exception:
-        return None, None
+        pass
+    return None, None, None
 
 
 class NetworkWidget(rumps.App):
@@ -59,21 +85,36 @@ class NetworkWidget(rumps.App):
         self.dl_mbps = None
         self.ul_mbps = None
         self.speed_running = False
-        self.ping_label = "Ping: —"
-        self.dl_label   = "Download: —"
-        self.ul_label   = "Upload: —"
+        self.ping_label   = "Ping: —"
+        self.dl_label     = "Download: —"
+        self.ul_label     = "Upload: —"
+        self.server_label = "Server: —"
+
+        # Speed test history (written by background thread, rebuilt on main thread)
+        self.speed_history = []   # list of dicts: {time, dl, ul, server}
+        self._history_dirty = False
 
         # Menu items
-        self.ping_item  = rumps.MenuItem("Ping: —")
-        self.dl_item    = rumps.MenuItem("Download: —")
-        self.ul_item    = rumps.MenuItem("Upload: —")
-        self.next_speed = rumps.MenuItem("Next speed test: —")
+        self.ping_item   = rumps.MenuItem("Ping: —")
+        self.dl_item     = rumps.MenuItem("Download: —")
+        self.ul_item     = rumps.MenuItem("Upload: —")
+        self.server_item = rumps.MenuItem("Server: —")
+        self.next_speed  = rumps.MenuItem("Next speed test: —")
+        self.run_now_item = rumps.MenuItem("Run Speed Test Now", callback=self._on_run_now)
+
+        self.history_menu = rumps.MenuItem("Speed Test History")
+        self.history_menu.add(rumps.MenuItem("No history yet"))
+
         self.menu = [
             self.ping_item,
             self.dl_item,
             self.ul_item,
+            self.server_item,
+            None,
+            self.history_menu,
             None,
             self.next_speed,
+            self.run_now_item,
             None,
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
@@ -99,24 +140,60 @@ class NetworkWidget(rumps.App):
             self._speed_next_time = now + SPEED_INTERVAL
             threading.Thread(target=self._run_speed, daemon=True).start()
 
-        # Update title bar
-        ping_str = f"{self.ping_ms:.0f}ms" if self.ping_ms is not None else "⏳"
-        dl_str   = f"↓{self.dl_mbps:.0f}"  if self.dl_mbps  is not None else "↓?"
-        ul_str   = f"↑{self.ul_mbps:.0f}"  if self.ul_mbps  is not None else "↑?"
-        self.title = f"{ping_str}  {dl_str}/{ul_str} Mbps"
+        # Update title bar with compact attributed string
+        self._set_status_title()
 
         # Update menu item labels (written by background threads)
-        self.ping_item.title = self.ping_label
-        self.dl_item.title   = self.dl_label
-        self.ul_item.title   = self.ul_label
+        self.ping_item.title   = self.ping_label
+        self.dl_item.title     = self.dl_label
+        self.ul_item.title     = self.ul_label
+        self.server_item.title = self.server_label
 
-        # Countdown to next speed test
+        # Rebuild history submenu on main thread when new data arrives
+        if self._history_dirty:
+            self._history_dirty = False
+            self._rebuild_history_menu()
+
+        # Countdown / run-now state
         if self.speed_running:
-            self.next_speed.title = "Running speed test…"
+            self.next_speed.title   = "Running speed test…"
+            self.run_now_item.title = "Speed Test Running…"
+            self.run_now_item._menuitem.setEnabled_(False)
         else:
             remaining = max(0, int(self._speed_next_time - now))
             mins, secs = divmod(remaining, 60)
-            self.next_speed.title = f"Next speed test in: {mins}m {secs:02d}s"
+            self.next_speed.title   = f"Next speed test in: {mins}m {secs:02d}s"
+            self.run_now_item.title = "Run Speed Test Now"
+            self.run_now_item._menuitem.setEnabled_(True)
+
+    def _set_status_title(self):
+        """Render a compact colored-dot title directly onto the status bar button."""
+        text = f"● ↓{_fmt_speed(self.dl_mbps)} ↑{_fmt_speed(self.ul_mbps)}"
+        try:
+            if self.ping_ms is None:
+                dot_color = AppKit.NSColor.grayColor()
+            elif self.ping_ms < PING_GOOD:
+                dot_color = AppKit.NSColor.systemGreenColor()
+            elif self.ping_ms < PING_WARN:
+                dot_color = AppKit.NSColor.systemYellowColor()
+            else:
+                dot_color = AppKit.NSColor.systemRedColor()
+
+            font = AppKit.NSFont.menuBarFontOfSize_(0)
+            base_attrs = {AppKit.NSFontAttributeName: font}
+            attributed = AppKit.NSMutableAttributedString.alloc().initWithString_attributes_(
+                text, base_attrs
+            )
+            attributed.addAttribute_value_range_(
+                AppKit.NSForegroundColorAttributeName,
+                dot_color,
+                AppKit.NSMakeRange(0, 1),  # color only the ●
+            )
+            btn = self._nsapp.nsstatusitem.button()
+            if btn:
+                btn.setAttributedTitle_(attributed)
+        except Exception:
+            self.title = text  # plain-text fallback
 
     # ------------------------------------------------------------------
     # Background workers — only write to plain Python attributes
@@ -130,16 +207,45 @@ class NetworkWidget(rumps.App):
             self.ping_label = "Ping: error"
 
     def _run_speed(self):
-        dl, ul = measure_speed()
+        dl, ul, server = measure_speed()
         self.dl_mbps = dl
         self.ul_mbps = ul
+        entry = {"time": datetime.datetime.now(), "dl": dl, "ul": ul, "server": server}
         if dl is not None:
-            self.dl_label = f"Download: {dl:.1f} Mbps"
-            self.ul_label = f"Upload:   {ul:.1f} Mbps"
+            self.dl_label     = f"Download: {dl:.1f} Mbps"
+            self.ul_label     = f"Upload:   {ul:.1f} Mbps"
+            self.server_label = f"Server: {server}"
         else:
-            self.dl_label = "Download: error"
-            self.ul_label = "Upload:   error"
+            self.dl_label     = "Download: error"
+            self.ul_label     = "Upload:   error"
+            self.server_label = "Server: error"
+        self.speed_history.append(entry)
+        if len(self.speed_history) > MAX_HISTORY:
+            self.speed_history = self.speed_history[-MAX_HISTORY:]
+        self._history_dirty = True
         self.speed_running = False
+
+    def _rebuild_history_menu(self):
+        """Rebuild history submenu — must be called from the main thread."""
+        for key in list(self.history_menu.keys()):
+            del self.history_menu[key]
+        if not self.speed_history:
+            self.history_menu.add(rumps.MenuItem("No history yet"))
+            return
+        self.history_menu.title = f"Speed Test History ({len(self.speed_history)})"
+        for entry in reversed(self.speed_history):
+            ts = entry["time"].strftime("%m/%d %H:%M")
+            if entry["dl"] is not None:
+                label = f"{ts}  ↓{entry['dl']:.0f}  ↑{entry['ul']:.0f} Mbps"
+            else:
+                label = f"{ts}  error"
+            self.history_menu.add(rumps.MenuItem(label))
+
+    def _on_run_now(self, _):
+        if not self.speed_running:
+            self.speed_running = True
+            self._speed_next_time = time.time() + SPEED_INTERVAL
+            threading.Thread(target=self._run_speed, daemon=True).start()
 
 
 if __name__ == "__main__":
