@@ -6,7 +6,6 @@ Network Toolbar Widget
 """
 
 import rumps
-import AppKit
 import subprocess
 import threading
 import time
@@ -14,7 +13,7 @@ import datetime
 import json
 import re
 
-VERSION = "1.0"
+VERSION = "1.1"
 MAX_HISTORY = 10
 
 PING_INTERVAL = 60       # seconds
@@ -150,8 +149,12 @@ class NetworkWidget(rumps.App):
             self._speed_next_time = now + SPEED_INTERVAL
             threading.Thread(target=self._run_speed, daemon=True).start()
 
-        # Update title bar with compact attributed string
-        self._set_status_title()
+        # Update title bar
+        if self.ping_ms is None:       dot = "⚪"
+        elif self.ping_ms < PING_GOOD: dot = "🟢"
+        elif self.ping_ms < PING_WARN: dot = "🟡"
+        else:                          dot = "🔴"
+        self.title = f"{dot} ↓{_fmt_speed(self.dl_mbps)} ↑{_fmt_speed(self.ul_mbps)}"
 
         # Update menu item labels (written by background threads)
         self.ping_item.title   = self.ping_label
@@ -175,35 +178,6 @@ class NetworkWidget(rumps.App):
             self.next_speed.title   = f"Next speed test in: {mins}m {secs:02d}s"
             self.run_now_item.title = "Run Speed Test Now"
             self.run_now_item._menuitem.setEnabled_(True)
-
-    def _set_status_title(self):
-        """Render a compact colored-dot title directly onto the status bar button."""
-        text = f"● ↓{_fmt_speed(self.dl_mbps)} ↑{_fmt_speed(self.ul_mbps)}"
-        try:
-            if self.ping_ms is None:
-                dot_color = AppKit.NSColor.grayColor()
-            elif self.ping_ms < PING_GOOD:
-                dot_color = AppKit.NSColor.systemGreenColor()
-            elif self.ping_ms < PING_WARN:
-                dot_color = AppKit.NSColor.systemYellowColor()
-            else:
-                dot_color = AppKit.NSColor.systemRedColor()
-
-            font = AppKit.NSFont.menuBarFontOfSize_(0)
-            base_attrs = {AppKit.NSFontAttributeName: font}
-            attributed = AppKit.NSMutableAttributedString.alloc().initWithString_attributes_(
-                text, base_attrs
-            )
-            attributed.addAttribute_value_range_(
-                AppKit.NSForegroundColorAttributeName,
-                dot_color,
-                AppKit.NSMakeRange(0, 1),  # color only the ●
-            )
-            btn = self._nsapp.nsstatusitem.button()
-            if btn:
-                btn.setAttributedTitle_(attributed)
-        except Exception:
-            self.title = text  # plain-text fallback
 
     # ------------------------------------------------------------------
     # Background workers — only write to plain Python attributes

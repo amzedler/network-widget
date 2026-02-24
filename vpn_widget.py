@@ -7,19 +7,18 @@ VPN Toolbar Widget
 """
 
 import rumps
-import AppKit
 import subprocess
 import threading
 import time
 import re
 from datetime import datetime
 
-VERSION = "1.0"
+VERSION = "1.1"
 REFRESH_INTERVAL = 30  # seconds
 
 
 def get_vpn_connections():
-    """Returns list of dicts for each VPN: {name, status, interface, ip, dns, connected_since, is_primary}."""
+    """Returns list of dicts: {name, status, interface, ip, dns, connected_since, is_primary}."""
     connections = []
     try:
         result = subprocess.run(
@@ -49,10 +48,10 @@ def get_vpn_connections():
                 dns_m     = re.search(r'DNSServers\s*:.*?0\s*:\s*([\d.]+)', t, re.DOTALL)
                 primary_m = re.search(r'IsPrimaryInterface\s*:\s*(\d+)', t)
                 time_m    = re.search(r'LastStatusChangeTime\s*:\s*(.+)', t)
-                if iface_m:   vpn["interface"]  = iface_m.group(1)
-                if ip_m:      vpn["ip"]          = ip_m.group(1)
-                if dns_m:     vpn["dns"]          = dns_m.group(1)
-                if primary_m: vpn["is_primary"]   = primary_m.group(1) == "1"
+                if iface_m:   vpn["interface"]      = iface_m.group(1)
+                if ip_m:      vpn["ip"]              = ip_m.group(1)
+                if dns_m:     vpn["dns"]             = dns_m.group(1)
+                if primary_m: vpn["is_primary"]      = primary_m.group(1) == "1"
                 if time_m:
                     try:
                         vpn["connected_since"] = datetime.strptime(
@@ -70,18 +69,23 @@ class VpnWidget(rumps.App):
     def __init__(self):
         super().__init__("⏳", quit_button=None)
 
-        # State (written by background thread, read by main-thread timer)
         self.vpn_connections = []
         self._dirty = False
-        self._last_refresh = 0
 
-        # Static menu items
-        self._vpn_items = []   # dynamically rebuilt
-        self.separator1  = None
+        # Fixed menu items — titles updated in place, no add/remove
+        self.status_item  = rumps.MenuItem("Detecting…")
+        self.iface_item   = rumps.MenuItem("")
+        self.ip_item      = rumps.MenuItem("")
+        self.dns_item     = rumps.MenuItem("")
+        self.since_item   = rumps.MenuItem("")
         self.refresh_item = rumps.MenuItem("Refresh", callback=self._on_refresh)
 
         self.menu = [
-            rumps.MenuItem("Detecting…"),
+            self.status_item,
+            self.iface_item,
+            self.ip_item,
+            self.dns_item,
+            self.since_item,
             None,
             self.refresh_item,
             None,
@@ -90,126 +94,70 @@ class VpnWidget(rumps.App):
 
         self._next_refresh = 0  # fire immediately on first tick
 
-    # ------------------------------------------------------------------
-    # Main-thread timer
-    # ------------------------------------------------------------------
     @rumps.timer(1)
     def ui_tick(self, _):
         now = time.time()
-
-        # Kick off a background refresh if due
         if now >= self._next_refresh:
             self._next_refresh = now + REFRESH_INTERVAL
             threading.Thread(target=self._run_refresh, daemon=True).start()
 
-        # Rebuild UI when new data arrives
         if self._dirty:
             self._dirty = False
-            self._rebuild_menu()
-            self._update_title()
+            self._update_ui()
 
-    # ------------------------------------------------------------------
-    # Background worker
-    # ------------------------------------------------------------------
     def _run_refresh(self):
         self.vpn_connections = get_vpn_connections()
         self._dirty = True
 
-    # ------------------------------------------------------------------
-    # Main-thread UI updates
-    # ------------------------------------------------------------------
-    def _update_title(self):
+    def _update_ui(self):
         connected = [v for v in self.vpn_connections if v["status"] == "Connected"]
-        text = self._title_text(connected)
-        color = self._title_color(connected)
-        try:
-            font = AppKit.NSFont.menuBarFontOfSize_(0)
-            base_attrs = {AppKit.NSFontAttributeName: font}
-            attributed = AppKit.NSMutableAttributedString.alloc().initWithString_attributes_(
-                text, base_attrs
-            )
-            attributed.addAttribute_value_range_(
-                AppKit.NSForegroundColorAttributeName,
-                color,
-                AppKit.NSMakeRange(0, 1),
-            )
-            btn = self._nsapp.nsstatusitem.button()
-            if btn:
-                btn.setAttributedTitle_(attributed)
-        except Exception:
-            self.title = text
+        primary   = next((v for v in connected if v["is_primary"]), connected[0] if connected else None)
 
-    def _title_text(self, connected):
-        if not connected:
-            return "○ No VPN"
-        primary = next((v for v in connected if v["is_primary"]), connected[0])
-        iface = primary["interface"] or "utun?"
-        if len(connected) > 1:
-            return f"● {iface} +{len(connected) - 1}"
-        return f"● {iface}"
-
-    def _title_color(self, connected):
-        if not connected:
-            return AppKit.NSColor.grayColor()
-        return AppKit.NSColor.systemGreenColor()
-
-    def _rebuild_menu(self):
-        # Clear everything except the static tail (Refresh, separator, Quit)
-        for key in list(self.menu.keys()):
-            item = self.menu[key]
-            if hasattr(item, 'title') and item.title in ("Refresh", "Quit"):
-                continue
-            del self.menu[key]
-
-        connected    = [v for v in self.vpn_connections if v["status"] == "Connected"]
-        disconnected = [v for v in self.vpn_connections if v["status"] != "Connected"]
-
-        entries = []
-
-        if not self.vpn_connections:
-            entries.append(rumps.MenuItem("No VPN services found"))
+        # Title bar
+        if primary:
+            iface = primary["interface"] or "utun?"
+            extra = f" +{len(connected)-1}" if len(connected) > 1 else ""
+            self.title = f"🟢 {iface}{extra}"
+        elif any(v["status"] == "Connecting" for v in self.vpn_connections):
+            self.title = "🟡 Connecting…"
         else:
-            for vpn in connected:
-                iface = vpn["interface"] or "utun?"
-                label = f"{vpn['name']}  ({iface})"
-                parent = rumps.MenuItem(label)
-                if vpn["ip"]:
-                    parent.add(rumps.MenuItem(f"IP:        {vpn['ip']}"))
-                if vpn["dns"]:
-                    parent.add(rumps.MenuItem(f"DNS:       {vpn['dns']}"))
-                if vpn["connected_since"]:
-                    since = vpn["connected_since"].strftime("%m/%d %H:%M")
-                    elapsed = self._elapsed(vpn["connected_since"])
-                    parent.add(rumps.MenuItem(f"Connected: {since}  ({elapsed})"))
-                entries.append(parent)
+            self.title = "⚫ No VPN"
 
-            if disconnected:
-                entries.append(None)
-                for vpn in disconnected:
-                    entries.append(rumps.MenuItem(f"○ {vpn['name']}  ({vpn['status']})"))
-
-        entries.append(None)
-
-        # Rebuild menu preserving Refresh and Quit at the end
-        new_menu = entries + [self.refresh_item, None,
-                              rumps.MenuItem("Quit", callback=rumps.quit_application)]
-        self.menu.clear()
-        for item in new_menu:
-            if item is None:
-                self.menu.add(rumps.separator)
+        # Menu items
+        if primary:
+            iface = primary["interface"] or "utun?"
+            self.status_item.title = f"{primary['name']}  —  Connected"
+            self.iface_item.title  = f"  Interface:  {iface}"
+            self.ip_item.title     = f"  IP:         {primary['ip'] or '—'}"
+            self.dns_item.title    = f"  DNS:        {primary['dns'] or '—'}"
+            if primary["connected_since"]:
+                since   = primary["connected_since"].strftime("%m/%d %H:%M")
+                elapsed = self._elapsed(primary["connected_since"])
+                self.since_item.title = f"  Since:      {since}  ({elapsed})"
             else:
-                self.menu.add(item)
+                self.since_item.title = ""
+        elif self.vpn_connections:
+            v = self.vpn_connections[0]
+            self.status_item.title = f"{v['name']}  —  {v['status']}"
+            self.iface_item.title  = ""
+            self.ip_item.title     = ""
+            self.dns_item.title    = ""
+            self.since_item.title  = ""
+        else:
+            self.status_item.title = "No VPN services found"
+            self.iface_item.title  = ""
+            self.ip_item.title     = ""
+            self.dns_item.title    = ""
+            self.since_item.title  = ""
 
     def _elapsed(self, since):
         delta = int((datetime.now() - since).total_seconds())
         h, rem = divmod(delta, 3600)
         m = rem // 60
-        if h:
-            return f"{h}h {m}m"
-        return f"{m}m"
+        return f"{h}h {m}m" if h else f"{m}m"
 
     def _on_refresh(self, _):
-        self._next_refresh = 0  # force immediate refresh on next tick
+        self._next_refresh = 0
 
 
 if __name__ == "__main__":

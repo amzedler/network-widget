@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-VERSION = "1.0"
+VERSION = "1.1"
 APP_NAME = f"VPN Widget {VERSION}"
 
 a = Analysis(
@@ -8,7 +8,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['rumps', 'AppKit'],
+    hiddenimports=['rumps'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
