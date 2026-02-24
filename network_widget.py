@@ -12,7 +12,7 @@ import threading
 import time
 import datetime
 import json
-import glob
+import re
 
 VERSION = "1.0"
 MAX_HISTORY = 10
@@ -41,10 +41,6 @@ def measure_ping():
     return None
 
 
-# Resolve fast-cli from whatever Node version nvm has installed
-_fast_candidates = sorted(glob.glob("/Users/adamz/.nvm/versions/node/*/bin/fast"))
-FAST_CLI = _fast_candidates[-1] if _fast_candidates else "fast"
-
 # Ping thresholds for color indicator (ms)
 PING_GOOD = 50
 PING_WARN = 100
@@ -59,18 +55,32 @@ def _fmt_speed(mbps):
     return f"{mbps:.0f}M"
 
 
+def _physical_interface():
+    """Return the first non-VPN en* interface from scutil --nwi, or None."""
+    try:
+        result = subprocess.run(["scutil", "--nwi"], capture_output=True, text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            m = re.match(r'\s+(en\d+)\s*:', line)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
 def measure_speed():
     """Returns (download_mbps, upload_mbps, server_str) or (None, None, None) on failure."""
     try:
-        result = subprocess.run(
-            [FAST_CLI, "--upload", "--json"],
-            capture_output=True, text=True, timeout=120
-        )
+        iface = _physical_interface()
+        cmd = ["/usr/bin/networkQuality", "-c"]
+        if iface:
+            cmd += ["-I", iface]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         data = json.loads(result.stdout)
-        dl = data["downloadSpeed"]   # already in Mbps
-        ul = data["uploadSpeed"]
-        servers = ", ".join(data.get("serverLocations", [])[:2])
-        return dl, ul, f"fast.com ({servers})"
+        dl = data["dl_throughput"] / 1_000_000   # bits/s → Mbps
+        ul = data["ul_throughput"] / 1_000_000
+        label = iface or data.get("interface_name", "?")
+        return dl, ul, f"Apple CDN ({label})"
     except Exception:
         pass
     return None, None, None
