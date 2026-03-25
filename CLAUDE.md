@@ -4,92 +4,87 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Two macOS menu bar apps built with `rumps` (Python) and packaged as standalone `.app` bundles via PyInstaller. Both live in the same repo and share a similar build/deploy pattern.
+macOS menu bar apps for network and VPN monitoring.
 
-| App | Source | Spec | What it does |
-|-----|--------|------|--------------|
-| Network Widget | `network_widget.py` | `network_widget.spec` | Ping, download/upload speed in menu bar |
-| VPN Widget | `vpn_widget.py` | `vpn_widget.spec` | Shows active VPN interface (utun*) via `scutil` |
+| App | Source | Language | What it does |
+|-----|--------|----------|--------------|
+| Network Widget | `NetworkWidget.swift` | Swift (native) | Ping, download/upload speed with charts in menu bar |
+| VPN Widget | `vpn_widget.py` | Python (rumps) | Shows active VPN interface (utun*) via `scutil` |
 
 ## Build
 
-Always run from `/Users/adamz/network-widget/`:
+### Network Widget (Swift)
 
 ```bash
-# Build one app
-pyinstaller -y network_widget.spec
-pyinstaller -y vpn_widget.spec
+swiftc -O -o NetworkWidget NetworkWidget.swift -framework Cocoa
+```
 
-# Full clean build (required when source changes aren't picked up)
-rm -rf build dist
-pyinstaller -y network_widget.spec
+### VPN Widget (Python)
+
+```bash
 pyinstaller -y vpn_widget.spec
 ```
 
-**Important:** Always `rm -rf build dist` before rebuilding if previous deploys showed stale behaviour. PyInstaller caches bytecode and the bundle can silently run old code even after source edits.
+**Important:** Always `rm -rf build dist` before rebuilding the VPN widget if previous deploys showed stale behaviour.
 
-## Deploy
+## Bundle & Deploy
+
+### Network Widget
 
 ```bash
-# Remove old version first (one at a time, never batched rm)
-rm -rf "/Applications/Network Widget 1.1.app"
-cp -r "dist/Network Widget 1.1.app" "/Applications/"
+# Build .app bundle
+mkdir -p dist/NetworkWidget.app/Contents/MacOS
+cp NetworkWidget dist/NetworkWidget.app/Contents/MacOS/
+# Info.plist is already in dist/NetworkWidget.app/Contents/
 
+# Deploy
+rm -rf "/Applications/NetworkWidget.app"
+cp -r "dist/NetworkWidget.app" "/Applications/"
+open "/Applications/NetworkWidget.app"
+```
+
+### VPN Widget
+
+```bash
 rm -rf "/Applications/VPN Widget 1.1.app"
 cp -r "dist/VPN Widget 1.1.app" "/Applications/"
-
-open "/Applications/Network Widget 1.1.app"
 open "/Applications/VPN Widget 1.1.app"
 ```
 
 **Never** use `rm -rf` on multiple `/Applications/` paths in a single chained command — it has caused unintended deletion of other apps.
 
-## Versioning
-
-Both apps use a `VERSION` string in two places — keep them in sync when bumping:
-
-- `network_widget.py` → `VERSION = "X.X"`
-- `network_widget.spec` → `VERSION = "X.X"`
-- `vpn_widget.py` → `VERSION = "X.X"`
-- `vpn_widget.spec` → `VERSION = "X.X"`
-
-The spec derives the app bundle name as `f"Network Widget {VERSION}"`, so a version bump automatically produces a new uniquely-named `.app`.
-
 ## Architecture
 
-### Threading model (both widgets)
+### Network Widget (Swift, native Cocoa)
 
-Background threads **only write plain Python attributes**. The main-thread `@rumps.timer(1)` (`ui_tick`) reads those attributes and updates all UI. A `_dirty` flag signals when background data is ready to render. This avoids PyObjC thread-safety issues.
+- Single-file Swift app using `NSStatusItem` + `NSMenu` with `NSMenuDelegate`
+- Menu bar: colored `●` dot + ping value using `NSAttributedString` (monospaced digits, 11pt)
+- `menuWillOpen` builds the entire menu from cached data — no blocking calls on click
+- Background work via `DispatchQueue.global(qos: .utility)`, results dispatched back to main thread
+- **Ping:** `/sbin/ping -c 4 -q 8.8.8.8`, configurable interval (1s–60s) via Ping Frequency submenu
+- **Speed:** `networkQuality -c -I <iface>` where `<iface>` is the first `en*` from `scutil --nwi` (bypasses VPN)
+- **Charts:** Core Graphics line charts (`PingChartView`, `SpeedChartView`) with gradient fills, threshold lines, auto-scaling Y axis, 2-hour time window
+- **History:** up to 240 ping samples + 30 speed tests; speed history shown as stat rows in dropdown
 
-```
-Background thread  →  writes self.ping_ms / self.vpn_connections / etc.
-                   →  sets self._dirty = True
-Main thread timer  →  checks _dirty, updates self.title and menu item .title strings
-```
-
-### Menu bar title
-
-Both widgets set `self.title = "..."` with emoji status dots. **Do not use `NSAttributedString` or `self._nsapp.nsstatusitem`** — these APIs are not reliably accessible inside PyInstaller bundles and cause silent failures showing only the initial `⏳`.
-
-Ping/status colours use plain emoji: `🟢` `🟡` `🔴` `⚪` `⚫`
-
-### Network Widget specifics
-
-- **Ping:** `/sbin/ping -c 4 -q 8.8.8.8` every 60 s, parsed from the `min/avg/max` summary line
-- **Speed:** `networkQuality -c -I <iface>` where `<iface>` is the first `en*` entry from `scutil --nwi` — this bypasses the VPN tunnel and tests on the physical interface
-- **History:** last 10 speed results stored in `self.speed_history`; submenu rebuilt on main thread when `self._history_dirty` is set
-
-### VPN Widget specifics
+### VPN Widget (Python, rumps)
 
 - Data source: `scutil --nc list` + `scutil --nc status <name>` per connected VPN
-- Menu uses **fixed pre-allocated `rumps.MenuItem` instances** whose `.title` is updated in place — dynamic add/remove from the main menu is unreliable in rumps and should be avoided
-- Refreshes every 30 s; "Refresh" button forces immediate next tick
+- Menu uses **fixed pre-allocated `rumps.MenuItem` instances** whose `.title` is updated in place
+- Refreshes every 30s; "Refresh" button forces immediate next tick
 
 ## Dependencies
 
+### Network Widget
+- Xcode Command Line Tools (`swiftc`)
+- No external dependencies — Cocoa framework only
+- `networkQuality` and `scutil` are macOS system binaries
+
+### VPN Widget
 ```bash
 pip install rumps pyinstaller
 ```
 
-`networkQuality` and `scutil` are macOS system binaries — no install needed.
-`setup.py` is a legacy py2app file and is not used; PyInstaller specs are the active build system.
+## Legacy Files
+
+- `network_widget.py` / `network_widget.spec` — old Python/rumps version, superseded by `NetworkWidget.swift`
+- `setup.py` — legacy py2app file, not used

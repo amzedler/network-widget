@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-VERSION = "1.1"
+VERSION = "1.2"
 APP_NAME = f"Network Widget {VERSION}"
 
 a = Analysis(
@@ -8,7 +8,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['rumps'],
+    hiddenimports=['rumps', 'matplotlib', 'matplotlib.backends.backend_tkagg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

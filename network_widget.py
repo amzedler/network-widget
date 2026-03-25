@@ -2,7 +2,7 @@
 """
 Network Toolbar Widget
 - Ping: tested every 60 seconds (8.8.8.8)
-- Speed: tested every 60 minutes
+- Speed: tested every 10 minutes
 """
 
 import rumps
@@ -13,13 +13,17 @@ import datetime
 import json
 import re
 
-VERSION = "1.1"
-MAX_HISTORY = 10
+VERSION = "1.2"
+MAX_SPEED_HISTORY = 30   # ~5 hours at 10min intervals
+MAX_PING_HISTORY = 120   # ~2 hours at 60s intervals
 
 PING_INTERVAL = 60       # seconds
 SPEED_INTERVAL = 600     # seconds (10 minutes)
 PING_HOST = "8.8.8.8"
 PING_COUNT = 4
+
+PING_GOOD = 50   # ms
+PING_WARN = 100
 
 
 def measure_ping():
@@ -30,28 +34,12 @@ def measure_ping():
             capture_output=True, text=True, timeout=15
         )
         for line in result.stdout.splitlines():
-            # macOS ping summary: "round-trip min/avg/max/stddev = 4.123/5.456/6.789/0.123 ms"
             if "avg" in line or "min/avg" in line:
                 parts = line.split("=")[-1].strip().split("/")
-                avg_ms = float(parts[1])
-                return avg_ms
+                return float(parts[1])
     except Exception:
         pass
     return None
-
-
-# Ping thresholds for color indicator (ms)
-PING_GOOD = 50
-PING_WARN = 100
-
-
-def _fmt_speed(mbps):
-    """Format Mbps compactly: ≥1000 → single decimal Gbps, else integer Mbps."""
-    if mbps is None:
-        return "…"
-    if mbps >= 1000:
-        return f"{mbps / 1000:.1f}G"
-    return f"{mbps:.0f}M"
 
 
 def _physical_interface():
@@ -76,13 +64,74 @@ def measure_speed():
             cmd += ["-I", iface]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         data = json.loads(result.stdout)
-        dl = data["dl_throughput"] / 1_000_000   # bits/s → Mbps
+        dl = data["dl_throughput"] / 1_000_000
         ul = data["ul_throughput"] / 1_000_000
         label = iface or data.get("interface_name", "?")
         return dl, ul, f"Apple CDN ({label})"
     except Exception:
         pass
     return None, None, None
+
+
+def _fmt_speed(mbps):
+    if mbps is None:
+        return "–"
+    if mbps >= 1000:
+        return f"{mbps / 1000:.1f} Gbps"
+    return f"{mbps:.0f} Mbps"
+
+
+def _show_graph(ping_history, speed_history):
+    """Open a matplotlib window with ping and speed graphs."""
+    threading.Thread(target=_render_graph, args=(list(ping_history), list(speed_history)), daemon=True).start()
+
+
+def _render_graph(ping_history, speed_history):
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    fig, axes = plt.subplots(2, 1, figsize=(7, 5), sharex=True,
+                             gridspec_kw={"height_ratios": [1, 1], "hspace": 0.15})
+    fig.patch.set_facecolor("#1e1e1e")
+    for ax in axes:
+        ax.set_facecolor("#1e1e1e")
+        ax.tick_params(colors="#aaa", labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_color("#333")
+        ax.grid(True, color="#333", linewidth=0.5, alpha=0.7)
+
+    # --- Ping chart ---
+    ax_ping = axes[0]
+    if ping_history:
+        times = [e["time"] for e in ping_history]
+        pings = [e["ms"] for e in ping_history]
+        ax_ping.plot(times, pings, color="#4fc3f7", linewidth=1.5, marker=".", markersize=3)
+        ax_ping.axhline(y=PING_GOOD, color="#66bb6a", linewidth=0.8, linestyle="--", alpha=0.6)
+        ax_ping.axhline(y=PING_WARN, color="#ffa726", linewidth=0.8, linestyle="--", alpha=0.6)
+        ax_ping.fill_between(times, pings, alpha=0.1, color="#4fc3f7")
+    ax_ping.set_ylabel("Ping (ms)", color="#aaa", fontsize=10)
+    ax_ping.set_title("Network Performance", color="#ddd", fontsize=12, fontweight="bold", pad=10)
+
+    # --- Speed chart ---
+    ax_speed = axes[1]
+    if speed_history:
+        times = [e["time"] for e in speed_history if e["dl"] is not None]
+        dl = [e["dl"] for e in speed_history if e["dl"] is not None]
+        ul = [e["ul"] for e in speed_history if e["dl"] is not None]
+        if times:
+            ax_speed.plot(times, dl, color="#66bb6a", linewidth=1.5, marker="o", markersize=4, label="Download")
+            ax_speed.plot(times, ul, color="#ffa726", linewidth=1.5, marker="s", markersize=4, label="Upload")
+            ax_speed.fill_between(times, dl, alpha=0.1, color="#66bb6a")
+            ax_speed.fill_between(times, ul, alpha=0.1, color="#ffa726")
+            ax_speed.legend(fontsize=9, facecolor="#1e1e1e", edgecolor="#333", labelcolor="#aaa", loc="upper left")
+    ax_speed.set_ylabel("Speed (Mbps)", color="#aaa", fontsize=10)
+    ax_speed.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax_speed.set_xlabel("Time", color="#aaa", fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
 
 
 class NetworkWidget(rumps.App):
@@ -94,21 +143,19 @@ class NetworkWidget(rumps.App):
         self.dl_mbps = None
         self.ul_mbps = None
         self.speed_running = False
-        self.ping_label   = "Ping: —"
-        self.dl_label     = "Download: —"
-        self.ul_label     = "Upload: —"
-        self.server_label = "Server: —"
 
-        # Speed test history (written by background thread, rebuilt on main thread)
-        self.speed_history = []   # list of dicts: {time, dl, ul, server}
+        # History for graphs
+        self.ping_history = []    # [{time, ms}]
+        self.speed_history = []   # [{time, dl, ul, server}]
         self._history_dirty = False
 
         # Menu items
-        self.ping_item   = rumps.MenuItem("Ping: —")
-        self.dl_item     = rumps.MenuItem("Download: —")
-        self.ul_item     = rumps.MenuItem("Upload: —")
-        self.server_item = rumps.MenuItem("Server: —")
-        self.next_speed  = rumps.MenuItem("Next speed test: —")
+        self.ping_item    = rumps.MenuItem("Ping: –")
+        self.dl_item      = rumps.MenuItem("Download: –")
+        self.ul_item      = rumps.MenuItem("Upload: –")
+        self.server_item  = rumps.MenuItem("Server: –")
+        self.graph_item   = rumps.MenuItem("Show Graph", callback=self._on_show_graph)
+        self.next_speed   = rumps.MenuItem("Next speed test: –")
         self.run_now_item = rumps.MenuItem("Run Speed Test Now", callback=self._on_run_now)
 
         self.history_menu = rumps.MenuItem("Speed Test History")
@@ -120,6 +167,7 @@ class NetworkWidget(rumps.App):
             self.ul_item,
             self.server_item,
             None,
+            self.graph_item,
             self.history_menu,
             None,
             self.next_speed,
@@ -128,46 +176,46 @@ class NetworkWidget(rumps.App):
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
 
-        self._speed_next_time = 0  # triggers immediately on first UI tick
-        self._next_ping_time  = 0  # triggers immediately on first UI tick
+        self._speed_next_time = 0
+        self._next_ping_time  = 0
 
     # ------------------------------------------------------------------
-    # Main-thread timer — safe to update all UI here
+    # Main-thread timer
     # ------------------------------------------------------------------
     @rumps.timer(1)
     def ui_tick(self, _):
         now = time.time()
 
-        # Kick off a ping in the background if it's time
         if now >= self._next_ping_time:
             self._next_ping_time = now + PING_INTERVAL
             threading.Thread(target=self._run_ping, daemon=True).start()
 
-        # Kick off a speed test in the background if it's time
         if now >= self._speed_next_time and not self.speed_running:
             self.speed_running = True
             self._speed_next_time = now + SPEED_INTERVAL
             threading.Thread(target=self._run_speed, daemon=True).start()
 
-        # Update title bar
+        # Compact title: ● XXms  (mimics MemoryBar style)
         if self.ping_ms is None:       dot = "⚪"
         elif self.ping_ms < PING_GOOD: dot = "🟢"
         elif self.ping_ms < PING_WARN: dot = "🟡"
         else:                          dot = "🔴"
-        self.title = f"{dot} ↓{_fmt_speed(self.dl_mbps)} ↑{_fmt_speed(self.ul_mbps)}"
 
-        # Update menu item labels (written by background threads)
-        self.ping_item.title   = self.ping_label
-        self.dl_item.title     = self.dl_label
-        self.ul_item.title     = self.ul_label
-        self.server_item.title = self.server_label
+        if self.ping_ms is not None:
+            self.title = f"{dot} {self.ping_ms:.0f}ms"
+        else:
+            self.title = f"{dot} –"
 
-        # Rebuild history submenu on main thread when new data arrives
+        # Menu labels
+        if self.ping_ms is not None:
+            self.ping_item.title = f"Ping: {self.ping_ms:.1f} ms  ({PING_HOST})"
+        self.dl_item.title     = f"Download: {_fmt_speed(self.dl_mbps)}"
+        self.ul_item.title     = f"Upload: {_fmt_speed(self.ul_mbps)}"
+
         if self._history_dirty:
             self._history_dirty = False
             self._rebuild_history_menu()
 
-        # Countdown / run-now state
         if self.speed_running:
             self.next_speed.title   = "Running speed test…"
             self.run_now_item.title = "Speed Test Running…"
@@ -180,56 +228,54 @@ class NetworkWidget(rumps.App):
             self.run_now_item._menuitem.setEnabled_(True)
 
     # ------------------------------------------------------------------
-    # Background workers — only write to plain Python attributes
+    # Background workers
     # ------------------------------------------------------------------
     def _run_ping(self):
         ping = measure_ping()
         self.ping_ms = ping
         if ping is not None:
-            self.ping_label = f"Ping: {ping:.1f} ms  ({PING_HOST})"
-        else:
-            self.ping_label = "Ping: error"
+            self.ping_history.append({"time": datetime.datetime.now(), "ms": ping})
+            if len(self.ping_history) > MAX_PING_HISTORY:
+                self.ping_history = self.ping_history[-MAX_PING_HISTORY:]
 
     def _run_speed(self):
         dl, ul, server = measure_speed()
         self.dl_mbps = dl
         self.ul_mbps = ul
-        entry = {"time": datetime.datetime.now(), "dl": dl, "ul": ul, "server": server}
+        self.speed_history.append({
+            "time": datetime.datetime.now(), "dl": dl, "ul": ul, "server": server
+        })
         if dl is not None:
-            self.dl_label     = f"Download: {dl:.1f} Mbps"
-            self.ul_label     = f"Upload:   {ul:.1f} Mbps"
-            self.server_label = f"Server: {server}"
+            self.server_item.title = f"Server: {server}"
         else:
-            self.dl_label     = "Download: error"
-            self.ul_label     = "Upload:   error"
-            self.server_label = "Server: error"
-        self.speed_history.append(entry)
-        if len(self.speed_history) > MAX_HISTORY:
-            self.speed_history = self.speed_history[-MAX_HISTORY:]
+            self.server_item.title = "Server: error"
+        if len(self.speed_history) > MAX_SPEED_HISTORY:
+            self.speed_history = self.speed_history[-MAX_SPEED_HISTORY:]
         self._history_dirty = True
         self.speed_running = False
 
     def _rebuild_history_menu(self):
-        """Rebuild history submenu — must be called from the main thread."""
         for key in list(self.history_menu.keys()):
             del self.history_menu[key]
-        if not self.speed_history:
+        valid = [e for e in self.speed_history if e["dl"] is not None]
+        if not valid:
             self.history_menu.add(rumps.MenuItem("No history yet"))
             return
-        self.history_menu.title = f"Speed Test History ({len(self.speed_history)})"
-        for entry in reversed(self.speed_history):
-            ts = entry["time"].strftime("%m/%d %H:%M")
-            if entry["dl"] is not None:
-                label = f"{ts}  ↓{entry['dl']:.0f}  ↑{entry['ul']:.0f} Mbps"
-            else:
-                label = f"{ts}  error"
-            self.history_menu.add(rumps.MenuItem(label))
+        self.history_menu.title = f"Speed Test History ({len(valid)})"
+        for entry in reversed(valid):
+            ts = entry["time"].strftime("%H:%M")
+            self.history_menu.add(rumps.MenuItem(
+                f"{ts}  ↓{entry['dl']:.0f}  ↑{entry['ul']:.0f} Mbps"
+            ))
 
     def _on_run_now(self, _):
         if not self.speed_running:
             self.speed_running = True
             self._speed_next_time = time.time() + SPEED_INTERVAL
             threading.Thread(target=self._run_speed, daemon=True).start()
+
+    def _on_show_graph(self, _):
+        _show_graph(self.ping_history, self.speed_history)
 
 
 if __name__ == "__main__":
